@@ -1,0 +1,55 @@
+name = "zenos-jobs"
+main = "src/index.py"
+compatibility_date = "2026-04-05"
+workers_dev = true
+compatibility_flags = ["python_workers"]
+
+# Cron jobs run in UTC. Friday 00:00 IST equals Thursday 18:30 UTC.
+[triggers]
+crons = [
+  "*/10 * * * *",
+  "*/30 * * * *",
+  "15 * * * *",
+  "45 * * * *",
+  "30 18 * * 3"
+]
+
+[vars]
+ENVIRONMENT = "production"
+CACHE_WARM_CRON_CORE = "*/10 * * * *"
+CACHE_WARM_CRON_DISCOVERY = "*/30 * * * *"
+CACHE_WARM_CRON_SOCIAL = "15 * * * *"
+CACHE_WARM_CRON_ADMIN = "45 * * * *"
+E2E_WEEKLY_CRON = "30 18 * * 3"
+CACHE_TTL_SECONDS = "300"
+CACHE_WARM_TIMEOUT_MS = "25000"
+
+# Example defaults. Override per environment with wrangler secret/vars.
+FRONTEND_BASE_URL = "https://zenos.work"
+API_BASE_URL = "https://api.zenos.work"
+CACHE_WARM_URLS = ""
+CACHE_WARM_URLS_CORE = ""
+CACHE_WARM_URLS_DISCOVERY = ""
+CACHE_WARM_URLS_SOCIAL = ""
+CACHE_WARM_URLS_ADMIN = ""
+
+# Receivers separated by comma/semicolon/newline.
+END_TO_END_REPORT_RECEIVERS = ""
+
+# Endpoint that actually executes zenos-e2e/scripts/run-e2e.sh --ci and returns JSON summary.
+E2E_RUNNER_WEBHOOK_URL = ""
+E2E_RUNNER_AUTH_HEADER = ""
+E2E_RUNNER_AUTH_TOKEN = ""
+
+# Optional: custom webhook email provider.
+REPORT_EMAIL_WEBHOOK_URL = ""
+REPORT_EMAIL_WEBHOOK_TOKEN = ""
+
+# Optional: Resend provider for direct email dispatch.
+RESEND_FROM = "noreply@zenos.work"
+
+# Optional: status page URL for report links.
+E2E_REPORT_BASE_URL = ""
+
+# Shared secret for POST /notify endpoint.
+NOTIFY_SECRET = ""

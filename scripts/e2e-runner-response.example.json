@@ -1,0 +1,13 @@
+{
+  "ok": true,
+  "status": "success",
+  "runId": "run-20260405-235959",
+  "reportUrl": "https://reports.zenos.work/e2e/run-20260405-235959",
+  "summary": "passed=378, failed=0, skipped=17, durationMinutes=29.2",
+  "metrics": {
+    "passed": 378,
+    "failed": 0,
+    "skipped": 17,
+    "durationMinutes": 29.2
+  }
+}
