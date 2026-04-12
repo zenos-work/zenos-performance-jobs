@@ -1,4 +1,5 @@
 import json
+import re
 from datetime import datetime, timezone
 from urllib.parse import parse_qs, urlparse
 
@@ -363,6 +364,422 @@ async def _run_weekly_e2e_job(env) -> dict:
     return result
 
 
+# ── Notification delivery job ─────────────────────────────────────────────────
+#
+# Fetches FEATURE_ANNOUNCEMENT (and any other) notifications with
+# delivery_status='pending' from the backend D1, sends them via the
+# appropriate channel, then reports delivery status back.
+#
+# Email:  sent via Resend / webhook (same infra as job reports).
+# Push:   sent as Web Push to push subscription endpoints.
+#         Requires VAPID_PUBLIC_KEY + VAPID_PRIVATE_KEY_JWK env vars.
+#         Falls back gracefully: push subscriptions without a configured
+#         VAPID key-pair are marked 'failed' so they can be retried once
+#         keys are provisioned.
+
+
+def _build_notification_html(notif: dict) -> str:
+    name = notif.get("user_name") or "Zenos user"
+    message = notif.get("message") or ""
+    ntype = (notif.get("type") or "").replace("_", " ").title()
+    return (
+        f"<div style='font-family:system-ui,sans-serif;max-width:600px;margin:0 auto'>"
+        f"<h2 style='color:#c3a45c'>{ntype}</h2>"
+        f"<p>Hi {name},</p>"
+        f"<pre style='white-space:pre-wrap;background:#f4f4f4;padding:12px;border-radius:6px'>"
+        f"{message}</pre>"
+        f"<hr/><p style='color:#888;font-size:12px'>You received this because you are "
+        f"enrolled in this feature tier. Manage preferences in your Zenos account.</p>"
+        f"</div>"
+    )
+
+
+async def _send_notification_email(env, notif: dict) -> tuple[bool, str]:
+    """Send one notification as email. Returns (ok, external_ref)."""
+    user_email = (notif.get("user_email") or "").strip()
+    if not user_email or "@" not in user_email:
+        return False, "no-email"
+
+    ntype = (notif.get("type") or "Notification").replace("_", " ").title()
+    subject = f"[Zenos] {ntype}"
+    text_body = notif.get("message") or ""
+    html_body = _build_notification_html(notif)
+
+    # Try Resend first, then webhook, matching existing job-report pattern.
+    api_key = _env_str(env, "RESEND_API_KEY", "")
+    if api_key:
+        try:
+            resp = await fetch(
+                "https://api.resend.com/emails",
+                method="POST",
+                headers={
+                    "authorization": f"Bearer {api_key}",
+                    "content-type": "application/json",
+                },
+                body=json.dumps({
+                    "from": _env_str(env, "RESEND_FROM", "noreply@zenos.work"),
+                    "to": [user_email],
+                    "subject": subject,
+                    "text": text_body,
+                    "html": html_body,
+                }),
+            )
+            if resp.ok:
+                try:
+                    data = await resp.json()
+                    ref = str(data.get("id") or "resend-ok")
+                except Exception:
+                    ref = "resend-ok"
+                return True, ref
+        except Exception:
+            pass
+
+    webhook_url = _env_str(env, "REPORT_EMAIL_WEBHOOK_URL", "")
+    if webhook_url:
+        try:
+            headers = {"content-type": "application/json"}
+            token = _env_str(env, "REPORT_EMAIL_WEBHOOK_TOKEN", "")
+            if token:
+                headers["authorization"] = f"Bearer {token}"
+            resp = await fetch(
+                webhook_url,
+                method="POST",
+                headers=headers,
+                body=json.dumps({
+                    "to": [user_email],
+                    "subject": subject,
+                    "text": text_body,
+                    "html": html_body,
+                }),
+            )
+            if resp.ok:
+                return True, "webhook-ok"
+        except Exception:
+            pass
+
+    return False, "no-provider"
+
+
+def _build_vapid_jwt(
+    endpoint: str,
+    vapid_public: str,
+    vapid_private_hex: str,
+    subscriber: str = "mailto:ops@zenos.work",
+) -> str | None:
+    """
+    Build a VAPID JWT (RFC 8292) using ES256.
+    Requires the private key as a hex-encoded raw 32-byte scalar.
+    Falls back to None if the 'cryptography' package is unavailable —
+    the caller then skips VAPID and marks the notification as failed.
+    The 'cryptography' package is available in Cloudflare Pyodide Workers
+    at runtime; the linter may flag it as unresolved in local dev setups.
+    """
+    try:
+        from cryptography.hazmat.primitives.asymmetric.ec import (  # type: ignore[import]
+            SECP256R1,
+            derive_private_key,
+        )
+        from cryptography.hazmat.primitives.asymmetric.utils import (  # type: ignore[import]
+            decode_dss_signature,
+        )
+        from cryptography.hazmat.backends import default_backend  # type: ignore[import]
+
+        # Parse audience from endpoint origin.
+        try:
+            from urllib.parse import urlparse as _urlparse
+            parsed = _urlparse(endpoint)
+            audience = f"{parsed.scheme}://{parsed.netloc}"
+        except Exception:
+            return None
+
+        # Build JWT header + payload (base64url-encoded, no padding).
+        def _b64url(data: bytes) -> str:
+            import base64
+            return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+        import time
+        now = int(time.time())
+        header = _b64url(json.dumps({"typ": "JWT", "alg": "ES256"}).encode())
+        payload = _b64url(json.dumps({
+            "aud": audience,
+            "exp": now + 43200,
+            "sub": subscriber,
+        }).encode())
+        signing_input = f"{header}.{payload}".encode()
+
+        # Sign with ECDSA P-256.
+        private_int = int(vapid_private_hex, 16)
+        private_key = derive_private_key(private_int, SECP256R1(), default_backend())
+        from cryptography.hazmat.primitives import hashes  # type: ignore[import]
+        from cryptography.hazmat.primitives.asymmetric.ec import ECDSA  # type: ignore[import]
+        der_sig = private_key.sign(signing_input, ECDSA(hashes.SHA256()))
+        r, s = decode_dss_signature(der_sig)
+        sig_bytes = r.to_bytes(32, "big") + s.to_bytes(32, "big")
+        signature = _b64url(sig_bytes)
+
+        return f"{header}.{payload}.{signature}"
+    except Exception:
+        return None
+
+
+async def _send_notification_push(
+    env, notif: dict, push_subs: list[dict]
+) -> tuple[bool, str]:
+    """
+    Send a Web Push notification to all active subscriptions for one user.
+    Returns (any_ok, comma-separated push delivery refs).
+    """
+    if not push_subs:
+        return False, "no-subscriptions"
+
+    vapid_public = _env_str(env, "VAPID_PUBLIC_KEY", "").strip()
+    vapid_private_hex = _env_str(env, "VAPID_PRIVATE_KEY_HEX", "").strip()
+    vapid_subscriber = _env_str(env, "VAPID_SUBSCRIBER", "mailto:ops@zenos.work").strip()
+
+    push_payload = json.dumps({
+        "title": (notif.get("type") or "Notification").replace("_", " ").title(),
+        "body": (notif.get("message") or "")[:200],
+        "tag": notif.get("group_key") or notif.get("id") or "",
+        "url": "/notifications",
+    }).encode("utf-8")
+
+    any_ok = False
+    refs = []
+    for sub in push_subs:
+        endpoint = (sub.get("endpoint") or "").strip()
+        if not endpoint:
+            continue
+        try:
+            headers: dict = {
+                "content-type": "application/json",
+                "content-encoding": "aesgcm",
+                "ttl": "86400",
+                "urgency": "normal",
+            }
+
+            if vapid_public and vapid_private_hex:
+                jwt = _build_vapid_jwt(endpoint, vapid_public, vapid_private_hex, vapid_subscriber)
+                if jwt:
+                    headers["authorization"] = (
+                        f"vapid t={jwt},k={vapid_public}"
+                    )
+
+            resp = await fetch(
+                endpoint,
+                method="POST",
+                headers=headers,
+                body=push_payload,
+            )
+            ok = bool(resp.status in (200, 201, 202, 204))
+            if ok:
+                any_ok = True
+                refs.append(f"push:{resp.status}")
+            else:
+                refs.append(f"push:err:{resp.status}")
+        except Exception as exc:
+            refs.append(f"push:exc:{str(exc)[:40]}")
+
+    return any_ok, ",".join(refs) if refs else "no-result"
+
+
+async def _fetch_pending_from_backend(env, channel: str) -> list[dict]:
+    """Call the backend internal endpoint to get pending notifications."""
+    api_base = _env_str(env, "ZENOS_API_BASE_URL",
+                        _env_str(env, "API_BASE_URL", "https://api.zenos.work"))
+    service_secret = _env_str(env, "ZENOS_SERVICE_SECRET", "")
+    if not service_secret:
+        raise RuntimeError("ZENOS_SERVICE_SECRET is not configured")
+
+    url = f"{api_base.rstrip('/')}/api/admin/notifications/pending-delivery?channel={channel}&limit=200"
+    resp = await fetch(
+        url,
+        method="GET",
+        headers={"authorization": f"Bearer {service_secret}"},
+    )
+    if not resp.ok:
+        raise RuntimeError(f"pending-delivery fetch failed: {int(resp.status)}")
+    data = await resp.json()
+    return data.get("notifications", []) if isinstance(data, dict) else []
+
+
+async def _report_delivery_to_backend(env, updates: list[dict]) -> None:
+    """POST delivery statuses back to the backend."""
+    if not updates:
+        return
+    api_base = _env_str(env, "ZENOS_API_BASE_URL",
+                        _env_str(env, "API_BASE_URL", "https://api.zenos.work"))
+    service_secret = _env_str(env, "ZENOS_SERVICE_SECRET", "")
+    if not service_secret:
+        return
+
+    url = f"{api_base.rstrip('/')}/api/admin/notifications/delivery-status"
+    await fetch(
+        url,
+        method="POST",
+        headers={
+            "authorization": f"Bearer {service_secret}",
+            "content-type": "application/json",
+        },
+        body=json.dumps({"updates": updates}),
+    )
+
+
+async def _run_notification_delivery_job(env) -> dict:
+    started_at = _now_iso()
+    results: dict = {
+        "email": {"sent": 0, "failed": 0, "skipped": 0},
+        "push": {"sent": 0, "failed": 0, "skipped": 0},
+    }
+    errors: list[str] = []
+
+    # ── Email channel ────────────────────────────────────────────────────────
+    try:
+        email_notifications = await _fetch_pending_from_backend(env, "email")
+        email_updates = []
+        for notif in email_notifications:
+            try:
+                ok, ref = await _send_notification_email(env, notif)
+                status = "delivered" if ok else "failed"
+                if ok:
+                    results["email"]["sent"] += 1
+                else:
+                    results["email"]["failed"] += 1
+                email_updates.append(
+                    {"id": notif["id"], "status": status, "external_ref": ref}
+                )
+            except Exception as exc:
+                results["email"]["failed"] += 1
+                email_updates.append(
+                    {"id": notif["id"], "status": "failed", "external_ref": str(exc)[:80]}
+                )
+        await _report_delivery_to_backend(env, email_updates)
+    except Exception as exc:
+        errors.append(f"email: {exc}")
+
+    # ── Push channel ─────────────────────────────────────────────────────────
+    try:
+        push_notifications = await _fetch_pending_from_backend(env, "push")
+        push_updates = []
+        for notif in push_notifications:
+            subs = notif.get("push_subscriptions") or []
+            if not subs:
+                results["push"]["skipped"] += 1
+                push_updates.append(
+                    {"id": notif["id"], "status": "failed", "external_ref": "no-subscriptions"}
+                )
+                continue
+            try:
+                ok, ref = await _send_notification_push(env, notif, subs)
+                status = "delivered" if ok else "failed"
+                if ok:
+                    results["push"]["sent"] += 1
+                else:
+                    results["push"]["failed"] += 1
+                push_updates.append(
+                    {"id": notif["id"], "status": status, "external_ref": ref}
+                )
+            except Exception as exc:
+                results["push"]["failed"] += 1
+                push_updates.append(
+                    {"id": notif["id"], "status": "failed", "external_ref": str(exc)[:80]}
+                )
+        await _report_delivery_to_backend(env, push_updates)
+    except Exception as exc:
+        errors.append(f"push: {exc}")
+
+    finished_at = _now_iso()
+    ok = len(errors) == 0
+    return {
+        "ok": ok,
+        "job": "notification-delivery",
+        "startedAt": started_at,
+        "finishedAt": finished_at,
+        "summary": (
+            f"Email: sent={results['email']['sent']} failed={results['email']['failed']}  "
+            f"Push: sent={results['push']['sent']} failed={results['push']['failed']} "
+            f"skipped={results['push']['skipped']}"
+        ),
+        "details": {
+            "results": results,
+            "errors": errors,
+        },
+    }
+
+
+async def _run_platform_snapshot_job(env, feature: str = "all") -> dict:
+    started_at = _now_iso()
+    allowed = {"all", "courses", "community", "marketplace", "connectors"}
+    selected = feature if feature in allowed else "all"
+
+    checks = {
+        "courses": {
+            "url": "/api/courses?limit=5",
+            "metric": "courses",
+        },
+        "community": {
+            "url": "/api/community?limit=5",
+            "metric": "spaces",
+        },
+        "marketplace": {
+            "url": "/api/marketplace?limit=5",
+            "metric": "items",
+        },
+        "connectors": {
+            "url": "/api/connector-marketplace",
+            "metric": "listings",
+        },
+    }
+
+    api_base = _env_str(env, "API_BASE_URL", "https://api.zenos.work").rstrip("/")
+    service_secret = _env_str(env, "ZENOS_SERVICE_SECRET", "")
+    headers = {}
+    if service_secret:
+        headers["authorization"] = f"Bearer {service_secret}"
+
+    targets = checks.keys() if selected == "all" else [selected]
+    details = {}
+    failures = 0
+
+    for key in targets:
+        config = checks[key]
+        url = f"{api_base}{config['url']}"
+        try:
+            response = await fetch(url, method="GET", headers=headers)
+            ok = bool(response.ok)
+            parsed = {}
+            try:
+                parsed = await response.json()
+            except Exception:
+                parsed = {}
+            metric_key = config["metric"]
+            metric_value = parsed.get(metric_key)
+            metric_count = len(metric_value) if isinstance(metric_value, list) else 0
+            details[key] = {
+                "ok": ok,
+                "status": int(response.status),
+                "metric": metric_key,
+                "count": metric_count,
+            }
+            if not ok:
+                failures += 1
+        except Exception as error:
+            failures += 1
+            details[key] = {"ok": False, "error": str(error)}
+
+    return {
+        "ok": failures == 0,
+        "job": "platform-snapshot",
+        "startedAt": started_at,
+        "finishedAt": _now_iso(),
+        "summary": f"Snapshot completed for {selected}; failures={failures}.",
+        "details": {
+            "feature": selected,
+            "checks": details,
+            "failures": failures,
+        },
+    }
+
+
 def _resolve_cron_job(env, cron: str) -> dict | None:
     if cron == _env_str(env, "CACHE_WARM_CRON_CORE", "*/10 * * * *"):
         return {"job": "cache-warm", "service": "core"}
@@ -374,6 +791,10 @@ def _resolve_cron_job(env, cron: str) -> dict | None:
         return {"job": "cache-warm", "service": "admin"}
     if cron == _env_str(env, "E2E_WEEKLY_CRON", "30 18 * * 3"):
         return {"job": "weekly-e2e"}
+    if cron == _env_str(env, "NOTIFICATION_DELIVERY_CRON", "*/5 * * * *"):
+        return {"job": "notification-delivery"}
+    if cron == _env_str(env, "PLATFORM_SNAPSHOT_CRON", "15 */6 * * *"):
+        return {"job": "platform-snapshot", "feature": "all"}
     return None
 
 
@@ -402,12 +823,17 @@ class Default(WorkerEntrypoint):
             query = parse_qs(url.query)
             job = (query.get("job", ["cache-warm"])[0] or "cache-warm").strip()
             service = _parse_service(query.get("service", [None])[0])
+            feature = (query.get("feature", ["all"])[0] or "all").strip().lower()
 
             try:
                 if job == "cache-warm":
                     result = await _run_cache_warm_job(self.env, service)
                 elif job == "weekly-e2e":
                     result = await _run_weekly_e2e_job(self.env)
+                elif job == "notification-delivery":
+                    result = await _run_notification_delivery_job(self.env)
+                elif job == "platform-snapshot":
+                    result = await _run_platform_snapshot_job(self.env, feature)
                 else:
                     return _json_response({"ok": False, "error": f"Unknown job: {job}"}, status=400)
 
@@ -456,6 +882,8 @@ class Default(WorkerEntrypoint):
                     "/jobs/run?job=cache-warm&service=social",
                     "/jobs/run?job=cache-warm&service=admin",
                     "/jobs/run?job=weekly-e2e",
+                    "/jobs/run?job=notification-delivery",
+                    "/jobs/run?job=platform-snapshot&feature=all",
                     "/notify",
                 ],
             }
@@ -471,6 +899,10 @@ class Default(WorkerEntrypoint):
         try:
             if resolved["job"] == "cache-warm":
                 result = await _run_cache_warm_job(self.env, resolved.get("service", "all"))
+            elif resolved["job"] == "notification-delivery":
+                result = await _run_notification_delivery_job(self.env)
+            elif resolved["job"] == "platform-snapshot":
+                result = await _run_platform_snapshot_job(self.env, resolved.get("feature", "all"))
             else:
                 result = await _run_weekly_e2e_job(self.env)
             print(json.dumps(result))

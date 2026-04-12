@@ -11,7 +11,8 @@ crons = [
   "*/30 * * * *",
   "15 * * * *",
   "45 * * * *",
-  "30 18 * * 3"
+  "30 18 * * 3",
+  "*/5 * * * *"
 ]
 
 [vars]
@@ -21,6 +22,7 @@ CACHE_WARM_CRON_DISCOVERY = "*/30 * * * *"
 CACHE_WARM_CRON_SOCIAL = "15 * * * *"
 CACHE_WARM_CRON_ADMIN = "45 * * * *"
 E2E_WEEKLY_CRON = "30 18 * * 3"
+NOTIFICATION_DELIVERY_CRON = "*/5 * * * *"
 CACHE_TTL_SECONDS = "300"
 CACHE_WARM_TIMEOUT_MS = "25000"
 
@@ -53,3 +55,18 @@ E2E_REPORT_BASE_URL = ""
 
 # Shared secret for POST /notify endpoint.
 NOTIFY_SECRET = ""
+
+# ── Notification delivery (set as wrangler secrets in production) ──────────────
+# Base URL for the Zenos backend API (defaults to API_BASE_URL if unset).
+ZENOS_API_BASE_URL = ""
+# Shared service-to-service secret — set via: wrangler secret put ZENOS_SERVICE_SECRET
+# Must match ZENOS_SERVICE_SECRET in zenos-backend environment.
+# ZENOS_SERVICE_SECRET = ""   # <-- secret: do not commit
+
+# VAPID keys for Web Push (RFC 8292).
+# Generate once with: npx web-push generate-vapid-keys
+# Store private key as: wrangler secret put VAPID_PRIVATE_KEY_HEX
+# Public key is safe to commit.
+VAPID_PUBLIC_KEY = ""
+VAPID_SUBSCRIBER = "mailto:ops@zenos.work"
+# VAPID_PRIVATE_KEY_HEX = ""  # <-- secret: do not commit
