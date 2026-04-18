@@ -818,21 +818,15 @@ async def _run_platform_snapshot_job(env, feature: str = "all") -> dict:
 
 
 def _resolve_cron_job(env, cron: str) -> dict | None:
-    if cron == _env_str(env, "CACHE_WARM_CRON_CORE", "*/10 * * * *"):
-        return {"job": "cache-warm", "service": "core-discovery"}
-    if cron == _env_str(env, "CACHE_WARM_CRON_SOCIAL_ADMIN", "15,45 * * * *"):
-        return {"job": "cache-warm", "service": "social-admin"}
-    if cron == _env_str(env, "E2E_WEEKLY_CRON", "30 18 * * 3"):
-        return {"job": "weekly-e2e"}
+    if cron == _env_str(env, "CACHE_WARM_CRON_ALL", "*/10 * * * *"):
+        return {"job": "cache-warm", "service": "all"}
     if cron == _env_str(env, "NOTIFICATION_DELIVERY_CRON", "*/5 * * * *"):
         return {"job": "notification-delivery"}
-    if cron == _env_str(env, "PLATFORM_SNAPSHOT_CRON", "15 */6 * * *"):
-        return {"job": "platform-snapshot", "feature": "all"}
     return None
 
 
 def _parse_service(raw: str | None) -> str:
-    allowed = {"all", "core", "discovery", "social", "admin", "core-discovery", "social-admin"}
+    allowed = {"all", "core", "discovery", "social", "admin"}
     value = (raw or "all").strip().lower()
     return value if value in allowed else "all"
 
@@ -860,18 +854,9 @@ class Default(WorkerEntrypoint):
 
             try:
                 if job == "cache-warm":
-                    if service == "core-discovery":
-                        result = await _run_cache_warm_core_discovery(self.env)
-                    elif service == "social-admin":
-                        result = await _run_cache_warm_services(self.env, ["social", "admin"])
-                    else:
-                        result = await _run_cache_warm_job(self.env, service)
-                elif job == "weekly-e2e":
-                    result = await _run_weekly_e2e_job(self.env)
+                    result = await _run_cache_warm_job(self.env, service)
                 elif job == "notification-delivery":
                     result = await _run_notification_delivery_job(self.env)
-                elif job == "platform-snapshot":
-                    result = await _run_platform_snapshot_job(self.env, feature)
                 else:
                     return _json_response({"ok": False, "error": f"Unknown job: {job}"}, status=400)
 
@@ -939,18 +924,11 @@ class Default(WorkerEntrypoint):
         try:
             if resolved["job"] == "cache-warm":
                 service = resolved.get("service", "all")
-                if service == "core-discovery":
-                    result = await _run_cache_warm_core_discovery(self.env)
-                elif service == "social-admin":
-                    result = await _run_cache_warm_services(self.env, ["social", "admin"])
-                else:
-                    result = await _run_cache_warm_job(self.env, service)
+                result = await _run_cache_warm_job(self.env, service)
             elif resolved["job"] == "notification-delivery":
                 result = await _run_notification_delivery_job(self.env)
-            elif resolved["job"] == "platform-snapshot":
-                result = await _run_platform_snapshot_job(self.env, resolved.get("feature", "all"))
             else:
-                result = await _run_weekly_e2e_job(self.env)
+                return print(f"Unknown job: {resolved['job']}")
             print(json.dumps(result))
         except Exception as error:
             print(json.dumps({"ok": False, "job": resolved["job"], "error": str(error)}))
