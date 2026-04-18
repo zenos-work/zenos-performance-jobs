@@ -168,6 +168,43 @@ async def _run_cache_warm_job(env, service: str = "all") -> dict:
     }
 
 
+async def _run_cache_warm_services(env, services: list[str]) -> dict:
+    started_at = _now_iso()
+    warmed = 0
+    failed = 0
+    results = []
+
+    for service in services:
+        result = await _run_cache_warm_job(env, service)
+        details = result.get("details", {})
+        warmed += int(details.get("warmed", 0))
+        failed += int(details.get("failed", 0))
+        results.append(result)
+
+    finished_at = _now_iso()
+    return {
+        "ok": failed == 0,
+        "job": "cache-warm",
+        "startedAt": started_at,
+        "finishedAt": finished_at,
+        "summary": f"Warmed {warmed} URLs, failed {failed} (services={','.join(services)}).",
+        "details": {
+            "services": services,
+            "warmed": warmed,
+            "failed": failed,
+            "results": results,
+        },
+    }
+
+
+async def _run_cache_warm_core_discovery(env) -> dict:
+    now = datetime.now(timezone.utc)
+    services = ["core"]
+    if now.minute % 30 == 0:
+        services.append("discovery")
+    return await _run_cache_warm_services(env, services)
+
+
 def _parse_receivers(raw: str) -> list[str]:
     if not raw:
         return []
@@ -782,13 +819,9 @@ async def _run_platform_snapshot_job(env, feature: str = "all") -> dict:
 
 def _resolve_cron_job(env, cron: str) -> dict | None:
     if cron == _env_str(env, "CACHE_WARM_CRON_CORE", "*/10 * * * *"):
-        return {"job": "cache-warm", "service": "core"}
-    if cron == _env_str(env, "CACHE_WARM_CRON_DISCOVERY", "*/30 * * * *"):
-        return {"job": "cache-warm", "service": "discovery"}
-    if cron == _env_str(env, "CACHE_WARM_CRON_SOCIAL", "15 * * * *"):
-        return {"job": "cache-warm", "service": "social"}
-    if cron == _env_str(env, "CACHE_WARM_CRON_ADMIN", "45 * * * *"):
-        return {"job": "cache-warm", "service": "admin"}
+        return {"job": "cache-warm", "service": "core-discovery"}
+    if cron == _env_str(env, "CACHE_WARM_CRON_SOCIAL_ADMIN", "15,45 * * * *"):
+        return {"job": "cache-warm", "service": "social-admin"}
     if cron == _env_str(env, "E2E_WEEKLY_CRON", "30 18 * * 3"):
         return {"job": "weekly-e2e"}
     if cron == _env_str(env, "NOTIFICATION_DELIVERY_CRON", "*/5 * * * *"):
@@ -799,7 +832,7 @@ def _resolve_cron_job(env, cron: str) -> dict | None:
 
 
 def _parse_service(raw: str | None) -> str:
-    allowed = {"all", "core", "discovery", "social", "admin"}
+    allowed = {"all", "core", "discovery", "social", "admin", "core-discovery", "social-admin"}
     value = (raw or "all").strip().lower()
     return value if value in allowed else "all"
 
@@ -827,7 +860,12 @@ class Default(WorkerEntrypoint):
 
             try:
                 if job == "cache-warm":
-                    result = await _run_cache_warm_job(self.env, service)
+                    if service == "core-discovery":
+                        result = await _run_cache_warm_core_discovery(self.env)
+                    elif service == "social-admin":
+                        result = await _run_cache_warm_services(self.env, ["social", "admin"])
+                    else:
+                        result = await _run_cache_warm_job(self.env, service)
                 elif job == "weekly-e2e":
                     result = await _run_weekly_e2e_job(self.env)
                 elif job == "notification-delivery":
@@ -881,6 +919,8 @@ class Default(WorkerEntrypoint):
                     "/jobs/run?job=cache-warm&service=discovery",
                     "/jobs/run?job=cache-warm&service=social",
                     "/jobs/run?job=cache-warm&service=admin",
+                    "/jobs/run?job=cache-warm&service=core-discovery",
+                    "/jobs/run?job=cache-warm&service=social-admin",
                     "/jobs/run?job=weekly-e2e",
                     "/jobs/run?job=notification-delivery",
                     "/jobs/run?job=platform-snapshot&feature=all",
@@ -898,7 +938,13 @@ class Default(WorkerEntrypoint):
 
         try:
             if resolved["job"] == "cache-warm":
-                result = await _run_cache_warm_job(self.env, resolved.get("service", "all"))
+                service = resolved.get("service", "all")
+                if service == "core-discovery":
+                    result = await _run_cache_warm_core_discovery(self.env)
+                elif service == "social-admin":
+                    result = await _run_cache_warm_services(self.env, ["social", "admin"])
+                else:
+                    result = await _run_cache_warm_job(self.env, service)
             elif resolved["job"] == "notification-delivery":
                 result = await _run_notification_delivery_job(self.env)
             elif resolved["job"] == "platform-snapshot":

@@ -8,9 +8,7 @@ compatibility_flags = ["python_workers"]
 [triggers]
 crons = [
   "*/10 * * * *",
-  "*/30 * * * *",
-  "15 * * * *",
-  "45 * * * *",
+  "15,45 * * * *",
   "30 18 * * 3",
   "*/5 * * * *"
 ]
@@ -18,11 +16,13 @@ crons = [
 [vars]
 ENVIRONMENT = "production"
 CACHE_WARM_CRON_CORE = "*/10 * * * *"
-CACHE_WARM_CRON_DISCOVERY = "*/30 * * * *"
-CACHE_WARM_CRON_SOCIAL = "15 * * * *"
-CACHE_WARM_CRON_ADMIN = "45 * * * *"
+CACHE_WARM_CRON_SOCIAL_ADMIN = "15,45 * * * *"
 E2E_WEEKLY_CRON = "30 18 * * 3"
 NOTIFICATION_DELIVERY_CRON = "*/5 * * * *"
+# Legacy cron vars kept for reference only - the worker now consolidates discovery with core and social/admin runs.
+# CACHE_WARM_CRON_DISCOVERY = "*/30 * * * *"
+# CACHE_WARM_CRON_SOCIAL = "15 * * * *"
+# CACHE_WARM_CRON_ADMIN = "45 * * * *"
 CACHE_TTL_SECONDS = "300"
 CACHE_WARM_TIMEOUT_MS = "25000"
 
