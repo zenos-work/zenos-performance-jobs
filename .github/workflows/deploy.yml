@@ -26,3 +26,7 @@ jobs:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           command: deploy
+        env:
+          VAPID_PUBLIC_KEY: ${{ vars.VAPID_PUBLIC_KEY }}
+          VAPID_PRIVATE_KEY_HEX: ${{ secrets.VAPID_PRIVATE_KEY_HEX }}
+          VAPID_SUBSCRIBER: ${{ vars.VAPID_SUBSCRIBER }}

@@ -68,5 +68,5 @@ ZENOS_API_BASE_URL = ""
 # Store private key as: wrangler secret put VAPID_PRIVATE_KEY_HEX
 # Public key is safe to commit.
 VAPID_PUBLIC_KEY = ""
-VAPID_SUBSCRIBER = "mailto:ops@zenos.work"
-# VAPID_PRIVATE_KEY_HEX = ""  # <-- secret: do not commit
+VAPID_SUBSCRIBER = ""
+VAPID_PRIVATE_KEY_HEX = ""
